@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#050308" />
+  <script>try{if(localStorage.getItem('zx-theme')==='light')document.documentElement.setAttribute('data-theme','light');}catch(e){}</script>
+  <title>ZX — Stream in Overdrive</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+  <!-- shared gradient defs for icons/logo -->
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute">
+    <defs>
+      <linearGradient id="zxgrad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#7c3aed" />
+        <stop offset="0.5" stop-color="#a855f7" />
+        <stop offset="1" stop-color="#c77dff" />
+      </linearGradient>
+      <linearGradient id="zxsheen" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#ffffff" stop-opacity="0.5" />
+        <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.05" />
+        <stop offset="1" stop-color="#ffffff" stop-opacity="0" />
+      </linearGradient>
+    </defs>
+  </svg>
+
+  <!-- ambient background: the charged void -->
+  <div class="bg-aura" aria-hidden="true">
+    <span class="aura a1"></span>
+    <span class="aura a2"></span>
+    <span class="aura a3"></span>
+  </div>
+  <div class="bg-field" aria-hidden="true"></div>
+  <!-- cinema texture: fine film grain + vignette -->
+  <div class="bg-grain" aria-hidden="true"></div>
+  <div class="bg-vignette" aria-hidden="true"></div>
+
+  <header class="nav" id="nav">
+    <a class="brand" id="homeLink" href="#/" aria-label="ZX home">
+      <span class="brand-mark">
+        <svg viewBox="0 0 44 44" width="40" height="40" aria-hidden="true">
+          <path d="M22 2 L40 12 V32 L22 42 L4 32 V12 Z" fill="url(#zxgrad)"/>
+          <path d="M22 3.4 L38.8 12.7 V31.3 L22 40.6 L5.2 31.3 V12.7 Z" fill="url(#zxsheen)"/>
+          <path d="M22 3.4 L38.8 12.7 V31.3 L22 40.6 L5.2 31.3 V12.7 Z" fill="none" stroke="#fff" stroke-opacity="0.34" stroke-width="1"/>
+          <path d="M14 15h12l-11 12h12" fill="none" stroke="#fff" stroke-width="2.6"
+                stroke-linecap="round" stroke-linejoin="round" opacity="0.98"/>
+        </svg>
+      </span>
+      <span class="brand-word">ZX</span>
+    </a>
+
+    <form class="search" id="searchForm" role="search" autocomplete="off">
+      <span class="search-ico" data-ico="search"></span>
+      <input id="searchInput" type="search" placeholder="Search for a movie or series…"
+             aria-label="Search" />
+      <button type="button" class="search-clear" id="searchClear" aria-label="Clear" hidden
+              data-ico="close"></button>
+    </form>
+
+    <nav class="nav-actions">
+      <a class="nav-btn" id="homeBtn" href="#/"><span data-ico="home"></span><em>Home</em></a>
+      <button type="button" class="nav-btn support-btn" id="supportBtn"><span data-ico="heart"></span><em>Support</em></button>
+      <button type="button" class="theme-toggle" id="themeToggle" aria-label="Toggle light and dark theme"><span></span></button>
+    </nav>
+  </header>
+
+  <main id="view" class="view"><!-- rendered here --></main>
+
+  <!-- Honeypot: invisible to humans (off-screen, not focusable, hidden from a11y
+       tree). Only a link-following scraper hits it; the server bans any session
+       that requests it. Do not remove or link from real UI. -->
+  <a href="/api/all-titles" aria-hidden="true" tabindex="-1" rel="nofollow"
+     style="position:absolute;left:-9999px;top:auto;width:1px;height:1px;overflow:hidden">All titles</a>
+
+  <footer class="foot">
+    <span class="brand-word small">ZX</span>
+    <span>Premium streaming experience</span>
+  </footer>
+
+  <!-- Player overlay -->
+  <div id="player" class="player" hidden>
+    <div class="player-scrim"></div>
+    <div class="player-stage" id="playerStage">
+      <video id="video" playsinline crossorigin="anonymous"></video>
+
+      <div class="pl-loading" id="plLoading"><span class="ring"></span></div>
+
+      <button class="pl-center" id="plCenter" aria-label="Play/Pause">
+        <span data-ico="play"></span>
+      </button>
+
+      <div class="pl-top">
+        <button class="pl-back icon-btn" id="plBack" aria-label="Back"><span data-ico="back"></span></button>
+        <div class="pl-heading">
+          <strong id="plTitle">—</strong>
+          <span id="plSub"></span>
+        </div>
+      </div>
+
+      <div class="pl-controls" id="plControls">
+        <div class="pl-seek">
+          <div class="pl-seek-track" id="seekTrack">
+            <div class="pl-seek-buffer" id="seekBuffer"></div>
+            <div class="pl-seek-fill" id="seekFill"></div>
+            <div class="pl-seek-knob" id="seekKnob"></div>
+          </div>
+        </div>
+        <div class="pl-row">
+          <button class="icon-btn" id="btnPlay" aria-label="Play/Pause"><span data-ico="play"></span></button>
+          <div class="pl-vol">
+            <button class="icon-btn" id="btnMute" aria-label="Mute"><span data-ico="volume"></span></button>
+            <input type="range" id="volRange" class="vol-range" min="0" max="1" step="0.02" value="1" aria-label="Volume" />
+          </div>
+          <span class="pl-time"><span id="tCur">0:00</span> <i>/</i> <span id="tDur">0:00</span></span>
+          <span class="pl-spacer"></span>
+
+          <div class="pl-menu" id="menuSubs">
+            <button class="icon-btn" id="btnSubs" aria-label="Subtitles"><span data-ico="cc"></span></button>
+            <div class="pl-pop" id="popSubs" hidden></div>
+          </div>
+          <div class="pl-menu" id="menuQual">
+            <button class="icon-btn quality-btn" id="btnQual" aria-label="Quality">
+              <span data-ico="quality"></span><em id="qualLabel">Auto</em>
+            </button>
+            <div class="pl-pop" id="popQual" hidden></div>
+          </div>
+          <button class="icon-btn" id="btnFull" aria-label="Fullscreen"><span data-ico="fullscreen"></span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <!-- Support overlay: a note from the creator + ways to help keep ZX free.
+       Arabic-first (the audience is Arabic-speaking); the ع/EN toggle flips language. -->
+  <div id="support" class="support" hidden>
+    <div class="support-scrim" id="supportScrim"></div>
+    <div class="support-card" id="supportCard" role="dialog" aria-modal="true" aria-labelledby="supTitle" dir="rtl">
+      <button class="support-lang" id="supportLang" type="button" aria-label="Switch to English">EN</button>
+      <button class="support-close" id="supportClose" aria-label="إغلاق"><span data-ico="close"></span></button>
+      <div class="support-heart"><span data-ico="heart"></span></div>
+      <span class="support-eyebrow" data-sup="eyebrow">من صاحب الموقع</span>
+      <h2 class="support-title" id="supTitle" data-sup="title">شكرًا لمشاهدتك.</h2>
+      <div class="support-body">
+        <p data-sup="body0">ZX موقع يبنيه ويديره شخص واحد — بدون إعلانات، بدون اشتراكات، وبدون أي أقفال VIP. مجرّد أفلام ومسلسلات، مجانية للجميع، دائمًا.</p>
+        <p data-sup="body1">وإن وجد له مكانًا في أمسياتك وأحببت أن تساهم في استمراره، فأي دعم بسيط يعني الكثير. لا ضغط إطلاقًا — وجودك هنا وحده أكثر من كافٍ.</p>
+      </div>
+      <div class="support-methods">
+        <div class="pay">
+          <div class="pay-head">
+            <span class="pay-ico" data-ico="binance"></span>
+            <div><strong data-sup="binTitle">معرّف Binance Pay</strong><em data-sup="binHint">من تطبيق Binance: اضغط Pay ثم أرسِل إلى هذا المعرّف</em></div>
+          </div>
+          <div class="pay-val">
+            <code id="binId" dir="ltr">770829727</code>
+            <button type="button" class="pay-copy" data-kind="binance" data-copy="770829727">
+              <span data-ico="copy"></span><span class="pay-copy-txt">نسخ</span>
+            </button>
+          </div>
+        </div>
+        <div class="pay">
+          <div class="pay-head">
+            <span class="pay-ico" data-ico="wallet"></span>
+            <div><strong data-sup="cryptoTitle">عملات رقمية — BEP20</strong><em data-sup="cryptoHint">شبكة BNB Smart Chain ‏(BEP20)‏ فقط — USDT وBNB وغيرها</em></div>
+          </div>
+          <div class="pay-val">
+            <code id="bep20" class="addr" dir="ltr">0x5fb7bcf1e399ae7f07daacc276882b5e201264a5</code>
+            <button type="button" class="pay-copy" data-kind="wallet" data-copy="0x5fb7bcf1e399ae7f07daacc276882b5e201264a5">
+              <span data-ico="copy"></span><span class="pay-copy-txt">نسخ</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="support-foot"><span data-ico="heart"></span> <span data-sup="foot">أيًّا كان الطريق الذي أوصلك إلى هنا — شكرًا لك. استمتع بالمشاهدة.</span></div>
+    </div>
+  </div>
+
+  <script src="/vendor/hls.min.js"></script>
+  <script src="/js/icons.js"></script>
+  <script src="/js/app.js"></script>
+  <script src="/js/fx.js"></script>
+  <script src="/js/theme.js"></script>
+</body>
+</html>
