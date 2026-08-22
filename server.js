@@ -19,7 +19,7 @@ const { LoklokClient, loadToken, DEFINITION_LABELS } = require('./lib/loklok');
 const { TokenManager } = require('./lib/auth');
 const sec = require('./lib/security');
 
-const PORT = process.env.PORT || 7817;
+const PORT = process.env.PORT || 3000;
 
 // ---- anti-scrape / anti-clone config --------------------------------------
 // The whole point of the session/token/pattern machinery below is that /api/*
