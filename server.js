@@ -648,6 +648,10 @@ app.get('/api/health', (req, res) => {
     daysLeft: auth.daysLeft(),
     account: auth.acct && auth.acct.email ? auth.acct.email.replace(/(.{3}).*(@.*)/, '$1***$2') : null,
     host: client.host,
+    // Catalog gate — 'full' means search returns Hollywood; 'restricted' means a
+    // stale deploy is sending keke=true and hiding it. See boot-log banner.
+    catalog: client.keke === 'false' ? 'full' : 'restricted',
+    keke: client.keke,
   });
 });
 
@@ -1014,6 +1018,15 @@ async function start() {
   }
   app.listen(PORT, () => {
     console.log(`ZX server on http://localhost:${PORT}  (token: ${client.token ? auth.daysLeft() + 'd left' : 'PENDING'})`);
+    // Boot-time catalog gate banner. This is the fastest way to tell a STALE
+    // deploy from a fresh one: keke='false' => full catalog (Spider-Man etc.);
+    // keke='true' => restricted/fuzzy catalog that HIDES Hollywood. If a host
+    // ever shows search junk again, read this line first before re-diagnosing.
+    console.log(
+      client.keke === 'false'
+        ? `[zx] search catalog: FULL (keke=false) — Hollywood visible`
+        : `[zx] search catalog: RESTRICTED (keke=${client.keke}) — Hollywood HIDDEN! set LOKLOK_KEKE=false or redeploy current code`
+    );
   });
 }
 start();
