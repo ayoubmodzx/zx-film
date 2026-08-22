@@ -12,5 +12,5 @@ RUN npm ci --omit=dev
 COPY . .
 
 # Northflank injects PORT; the app already reads process.env.PORT
-EXPOSE 7817
+EXPOSE 3000
 CMD ["node", "server.js"]
