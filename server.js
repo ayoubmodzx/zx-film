@@ -19,7 +19,7 @@ const { LoklokClient, loadToken, DEFINITION_LABELS } = require('./lib/loklok');
 const { TokenManager } = require('./lib/auth');
 const sec = require('./lib/security');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 7817;
 
 // ---- anti-scrape / anti-clone config --------------------------------------
 // The whole point of the session/token/pattern machinery below is that /api/*
@@ -518,10 +518,18 @@ function hiResImg(url, width) {
 }
 
 // Unified card shape from either a search resultItem or a browse searchResult.
+// The full-catalog regions localize titles with a trailing language tag, e.g.
+// "Spider-Man: Brand New Day[AR SUB]" (Arab region) or "…[RU Audio]" (CIS). We
+// claim a full-catalog region for discovery (see lib/loklok.js geo headers), so
+// strip that trailing tag for display — it's a locale marker, not part of the name.
+function cleanTitle(s) {
+  return String(s || '').replace(/\s*\[[^\]]*(?:SUB|AUDIO|DUB)[^\]]*\]\s*$/i, '').trim();
+}
+
 function toCard(it) {
   return {
     id: String(it.id),
-    name: it.name || it.matchTitle || '',
+    name: cleanTitle(it.name || it.matchTitle || ''),
     type: normType(it.subType || (it.dramaType && it.dramaType.code), it.domainType),
     cover: hiResImg(it.coverVerticalUrl || it.coverHorizontalUrl || '', 720),
     backdrop: hiResImg(it.coverHorizontalUrl || '', 1280),
@@ -652,6 +660,10 @@ app.get('/api/health', (req, res) => {
     // stale deploy is sending keke=true and hiding it. See boot-log banner.
     catalog: client.keke === 'false' ? 'full' : 'restricted',
     keke: client.keke,
+    // Claimed region (device-geo override). When set, the upstream picks the
+    // catalog region from this instead of the host's egress IP — see lib/loklok.js.
+    geoRegion: (client.geo && client.geo.isoCode) || null,
+    proxy: !!client.proxy, // routing upstream via a proxy egress? (fallback only)
   });
 });
 
@@ -779,8 +791,8 @@ app.get('/api/title/:id', async (req, res) => {
     res.json({
       id: String(id),
       category: det._category != null ? det._category : category,
-      name: d.name || '',
-      enName: d.enName || '',
+      name: cleanTitle(d.name || ''),
+      enName: cleanTitle(d.enName || ''),
       year: d.year || '',
       type: normType((d.drameTypeVo && d.drameTypeVo.drameType), d.domainType),
       cover: hiResImg(d.coverVerticalUrl || '', 720),
@@ -1027,6 +1039,30 @@ async function start() {
         ? `[zx] search catalog: FULL (keke=false) — Hollywood visible`
         : `[zx] search catalog: RESTRICTED (keke=${client.keke}) — Hollywood HIDDEN! set LOKLOK_KEKE=false or redeploy current code`
     );
+    // Region gate #2 is defeated by the device-reported geo headers (lib/loklok.js):
+    // we CLAIM geoIsoCode=<full-catalog country> with geoReliable='1', so the upstream
+    // picks the catalog region from that instead of this host's egress IP. The
+    // self-check below fires "spider man" and prints the region the upstream actually
+    // used — if the geo override is working, region == our claimed country (default SA)
+    // and Spider-Man shows, no matter where the host physically is. Fire-and-forget.
+    console.log(
+      client.geo && client.geo.isoCode
+        ? `[zx] region override: claiming geoIsoCode=${client.geo.isoCode} reliable=${client.geo.reliable} (no proxy/Gulf host needed)`
+        : `[zx] region override: DISABLED (geoIsoCode empty) — catalog will follow this host's egress IP`
+    );
+    (async () => {
+      try {
+        const r = await client.search('spider man', { size: 24 });
+        const names = ((r && r.data && r.data.resultItems) || []).map(x => x.name || x.matchTitle);
+        const spider = names.some(n => /spider-?man/i.test(n));
+        const via = client.proxy ? 'via proxy' : (client.geo && client.geo.isoCode ? `via geo=${client.geo.isoCode}` : 'direct');
+        console.log(spider
+          ? `[zx] catalog self-check: region=${r._region} (${via}) — FULL, Spider-Man visible ✔`
+          : `[zx] catalog self-check: region=${r._region} (${via}) — RESTRICTED (no Spider-Man). Geo override not honored: check geoReliable is the literal '1' (not 'true') and geoIsoCode is an uppercase full-catalog country (SA/AE/MA/DZ/RU). As a last resort set LOKLOK_PROXY to a MENA/RU egress.`);
+      } catch (e) {
+        console.log('[zx] catalog self-check skipped:', (e && e.message || e).toString().slice(0, 60));
+      }
+    })();
   });
 }
 start();
