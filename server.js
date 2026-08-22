@@ -532,6 +532,90 @@ function toCard(it) {
   };
 }
 
+// ---- search relevance ------------------------------------------------------
+// With keke='false' (see lib/loklok.js) the upstream returns the FULL catalog,
+// relevance-ranked with the best match first and looser "related" titles after
+// — the exact list the official app renders verbatim as "Related Movies"
+// ("spider man" -> Spider-Man: Brand New Day, Venom, Man Against Man, The
+// Spider…). So we no longer DROP anything: isRelevant() below is used only as a
+// sort key that floats the on-topic titles (distinctive-token matches) to the
+// top and keeps the related ones beneath, mirroring the app's "results first,
+// similar below" layout. The popular-rail fallback fires only when the upstream
+// returns nothing at all (e.g. "deadpool" -> 0 hits).
+const COMMON_WORDS = new Set(['the','a','an','of','and','or','to','in','on','my',
+  'your','you','me','man','men','woman','women','girl','boy','love','story','life',
+  'day','night','war','world','god','king','house','last','first','one','two','no',
+  'not','is','are','was','be','with','for','from','who','what','season','movie','film']);
+
+function normText(s) {
+  return String(s || '').toLowerCase()
+    .normalize('NFKD').replace(/[̀-ͯ]/g, '')      // strip accents
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
+function queryTokens(q) {
+  const words = normText(q).split(/\s+/).filter(Boolean);
+  const latin = words.filter(w => /^[a-z0-9]+$/.test(w));
+  const distinctive = latin.filter(w => w.length >= 3 && !COMMON_WORDS.has(w));
+  return { words, distinctive };
+}
+
+function titleHaystack(it) {
+  const f = [it.name, it.matchTitle, it.aliasName, it.enName];
+  if (Array.isArray(it.allLanguageNames)) f.push(...it.allLanguageNames);
+  if (Array.isArray(it.allLanguageAliasNames)) f.push(...it.allLanguageAliasNames);
+  return normText(f.filter(Boolean).join(' '));
+}
+
+function isRelevant(it, tk) {
+  const hay = titleHaystack(it);
+  if (!hay) return false;
+  const hayWords = hay.split(/\s+/);
+  const haySet = new Set(hayWords);
+  if (tk.distinctive.length) {
+    // at least one distinctive query word present whole, or sharing a >=4 stem
+    return tk.distinctive.some(t => haySet.has(t) ||
+      (t.length >= 4 && hayWords.some(w => w.length >= 4 &&
+        (w.startsWith(t.slice(0, 4)) || t.startsWith(w.slice(0, 4))))));
+  }
+  // query is only common words (e.g. "man") or non-latin — loose substring match
+  return tk.words.some(t => t.length >= 2 && (haySet.has(t) || hay.includes(t)));
+}
+
+// Normalize a query for the upstream tokenizer, which matches on word
+// boundaries: "spider-man" / "SpiderMan" both expand to "spider man" (which
+// returns the full related set), while a bare concatenation ("spiderman") can
+// only resolve to its single exact title. Hyphens/dots/underscores and
+// camelCase boundaries become spaces; runs of whitespace collapse.
+function searchQuery(raw) {
+  const spaced = String(raw || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[-_.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return spaced || String(raw || '');
+}
+
+// Popular titles used as the search fallback rail, mirroring the app's Recommend
+// section. Same source that powers the home page's curated rows (browse by count).
+async function trendingCards(limit = 18) {
+  try {
+    const [mv, tv] = await Promise.all([
+      client.browse({ params: 'MOVIE', order: 'count', size: limit }),
+      client.browse({ params: 'TV,SETI,VARIETY,DOCUMENTARY', order: 'count', size: limit }),
+    ]);
+    const m = (mv && mv.data && mv.data.searchResults) || [];
+    const t = (tv && tv.data && tv.data.searchResults) || [];
+    const seen = new Set(); const out = [];
+    for (let i = 0; i < Math.max(m.length, t.length) && out.length < limit; i++) {
+      for (const row of [m[i], t[i]]) {
+        if (row && row.id && !seen.has(String(row.id))) { seen.add(String(row.id)); out.push(toCard(row)); }
+      }
+    }
+    return out.slice(0, limit);
+  } catch { return []; }
+}
+
 function fail(res, code, msg, extra) {
   res.status(code).json(Object.assign({ error: msg }, extra || {}));
 }
@@ -640,21 +724,32 @@ app.get('/api/home', async (req, res) => {
 });
 
 app.get('/api/search', async (req, res) => {
-  const q = String(req.query.q || '').slice(0, 80).trim(); // cap length to curb abuse
-  if (!q) return res.json({ query: '', results: [], rawCount: 0 });
+  const raw = String(req.query.q || '').slice(0, 80).trim(); // cap length to curb abuse
+  if (!raw) return res.json({ query: '', results: [], rawCount: 0 });
   try {
+    const q = searchQuery(raw);                 // expand hyphen/camelCase for the tokenizer
     const sr = await client.search(q, { size: 30 });
     const region = sr && sr._region ? sr._region : null;
-    if (sr && sr.code && sr.code !== '00000') {
-      return res.json({ query: q, results: [], rawCount: 0, region, code: sr.code });
+    let items = [];
+    if (!(sr && sr.code && sr.code !== '00000')) {
+      items = (sr && sr.data && sr.data.resultItems) || [];
     }
-    const items = (sr && sr.data && sr.data.resultItems) || [];
-    // Only real, enterable titles ...
+    // Only real, enterable titles.
     const enterable = items.filter(it => it && it.id && it.allowEnterDetail !== 0);
-    // Return upstream results as-is — no relevance filtering. The filter could
-    // drop valid titles, so we surface whatever the API returns, in its order.
-    const results = enterable.map(toCard);
-    res.json({ query: q, results, rawCount: enterable.length, region });
+    if (enterable.length) {
+      // Keep every upstream hit (the app shows the "related" titles too), but
+      // float the on-topic ones to the front so it reads "matches first, similar
+      // below". Array.sort is stable, so equal-relevance items keep upstream order.
+      const tk = queryTokens(q);
+      const ranked = enterable
+        .map((it, i) => ({ it, i, rel: isRelevant(it, tk) ? 1 : 0 }))
+        .sort((a, b) => b.rel - a.rel || a.i - b.i)
+        .map(x => x.it);
+      return res.json({ query: raw, results: ranked.map(toCard), rawCount: enterable.length, region });
+    }
+    // Upstream returned nothing at all — show a popular rail, like the app does.
+    const recommended = await trendingCards(18);
+    return res.json({ query: raw, results: recommended, rawCount: 0, region, recommended: true });
   } catch (e) {
     oops(res, 502, 'search unavailable', e);
   }

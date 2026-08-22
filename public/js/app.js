@@ -258,9 +258,21 @@
     catch (e) { if (my === searchSeq) { view.innerHTML = backBtn() + stateHTML('warn', 'Search failed', 'Please try again.'); ZXIcons.apply(view); } return; }
     if (my !== searchSeq) return;
     const results = (data && data.results) || [];
+    const recommended = !!(data && data.recommended);
     if (!results.length) {
       view.innerHTML = backBtn() +
         stateHTML('search', 'No matches', `Nothing found for “${q}”. Try another title.`);
+      ZXIcons.apply(view); return;
+    }
+    if (recommended) {
+      // No title matched the query — show a popular rail, like the app does.
+      view.innerHTML = `${backBtn()}
+        <section class="section">
+          <div class="section-head"><h2 class="section-title">No matches for “${esc(q)}”</h2>
+          <span class="head-rule"></span>
+          <span class="head-count">Popular right now</span></div>
+          <div class="grid">${results.map(cardHTML).join('')}</div>
+        </section>`;
       ZXIcons.apply(view); return;
     }
     view.innerHTML = `${backBtn()}
