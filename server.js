@@ -28,8 +28,16 @@ const PORT = process.env.PORT || 7817;
 // consume the JSON API. Everything here is free and dependency-free (crypto +
 // Cloudflare's free tier out in front). See lib/security.js.
 const SITE_HOST = (process.env.ZX_SITE_HOST || '').toLowerCase(); // e.g. "zx.example.com" (empty => derive from Host)
-const TS_SITEKEY = process.env.ZX_TURNSTILE_SITEKEY || '';
-const TS_SECRET = process.env.ZX_TURNSTILE_SECRET || '';
+// The Turnstile SITE key is PUBLIC — it ships inside the client JS, so it's safe to
+// hardcode. The SECRET key is normally kept out of source; it's hardcoded here at the
+// owner's explicit request so the widget works without any host-side env config. If
+// this repo is ever made public, ROTATE the secret in the Cloudflare dashboard and
+// move it back to the ZX_TURNSTILE_SECRET env var — anyone with it can forge a pass.
+// Either value can still be overridden by an env var without touching code.
+const TS_SITEKEY_DEFAULT = '0x4AAAAAAEZdWAFIumYg0rqM';
+const TS_SECRET_DEFAULT = '0x4AAAAAAEZdWLClijqSJV0lOlidR_t0-Zk';
+const TS_SITEKEY = process.env.ZX_TURNSTILE_SITEKEY || TS_SITEKEY_DEFAULT;
+const TS_SECRET = process.env.ZX_TURNSTILE_SECRET || TS_SECRET_DEFAULT;
 const TURNSTILE_ON = !!(TS_SITEKEY && TS_SECRET);
 if (sec.EPHEMERAL) {
   console.warn('[sec] ZX_SECRET not set — using an ephemeral per-boot secret; every restart invalidates live sessions/tokens. Set ZX_SECRET in production.');
@@ -189,7 +197,7 @@ if (sessSweep.unref) sessSweep.unref();
 function freshSession(sid) {
   const now = Date.now();
   return {
-    sid, created: now, last: now, human: false, suspect: false, verified: false,
+    sid, created: now, last: now, human: false, suspect: false, verified: false, stepUp: false,
     ids: new Set(), idsWindowStart: now,   // distinct titles per 5-min window (enumeration signal)
     apiHits: 0, apiWindowStart: now,        // api calls per 1-min window (burst signal)
     strikes: 0, bannedUntil: 0,
@@ -287,6 +295,14 @@ function sniffSuspect(req) {
   if (!req.headers['accept-language']) return true;          // browsers always send it; many scrapers don't
   return false;
 }
+// Whether this session must clear the Turnstile human-check before the sensitive
+// endpoints open. Deliberately narrow: only sessions that tripped an automation
+// signal (suspect) or the behavioral step-up (stepUp) are ever asked. A plain
+// human visitor is neither, so they're never challenged — the gate is invisible
+// to them. No-op unless Turnstile is configured and the session isn't human yet.
+function needsHuman(s) {
+  return TURNSTILE_ON && !s.human && (s.suspect || s.stepUp);
+}
 // Resolve the session from the signed cookie. A validly-signed sid whose record
 // was swept/lost after a restart is re-registered so a live tab keeps working.
 function getSession(req) {
@@ -318,8 +334,17 @@ function clientIp(req) {
 // where <id> is a random handle into this map, bound to the issuing session and
 // short-lived. A movie bot can't reuse it (wrong sid), and no raw host/hdntl ever
 // reaches the client.
-const HLS_TTL = 3 * 60 * 1000;
-const SUB_TTL = 30 * 60 * 1000;        // subtitles are static + cached; longer handle
+// Must OUTLIVE a full movie. A VOD player fetches the media playlist exactly once,
+// so every segment handle is minted upfront (rewriteManifest) with this TTL and then
+// walked over the film's runtime. A 3-min TTL expired the later-segment handles before
+// the player reached them, so playback died ~3 min in (the sliding refresh in /api/hls
+// only helps handles that get RE-fetched, which VOD segments never are). Handles are
+// session+UA-bound and dropped on ban, so a long life costs nothing — tie it to the
+// session lifetime. Override via ZX_HLS_TTL_MS.
+const HLS_TTL = Number(process.env.ZX_HLS_TTL_MS || SESS_TTL);
+const SUB_TTL = SESS_TTL;              // subtitle handle is minted at play time but may
+                                       // not be fetched until the viewer switches the track
+                                       // mid-film — give it the session lifetime too.
 const hlsTokens = new Map(); // id -> { u, sid, ua, exp }
 const subTokens = new Map(); // id -> { u, sid, ua, exp }
 const hlsSweep = setInterval(() => {
@@ -391,6 +416,20 @@ function trackAndMaybeBan(s, req, p) {
   }
   if (now - s.apiWindowStart > 60 * 1000) { s.apiHits = 0; s.apiWindowStart = now; }
   s.apiHits++;
+
+  // Behavioral step-up (the invisible-to-humans layer). Before an outright ban,
+  // a session browsing unusually hard is flagged for a ONE-TIME Turnstile check:
+  // needsHuman() then makes the next sensitive call return {needVerify:true} and
+  // the SPA solves an invisible challenge in the background. A real visitor who
+  // simply browses fast clears it without seeing anything; an HTTP scraper can't
+  // solve Turnstile, so it never passes the sensitive gate and trips the ban
+  // below. Warn thresholds sit under the ban caps so the step-up always fires
+  // first. Only meaningful when Turnstile is on and the session isn't human yet.
+  if (TURNSTILE_ON && !s.human && !s.stepUp) {
+    const idWarn = s.suspect ? 8 : 18;
+    const hitWarn = s.suspect ? 30 : 70;
+    if (s.ids.size > idWarn || s.apiHits > hitWarn) s.stepUp = true;
+  }
 
   // Suspect sessions (headless/automation signals) get tighter thresholds:
   // real browsing rarely opens a dozen distinct titles a minute, but a bot does.
@@ -467,8 +506,14 @@ function apiGate(req, res, next) {
     return fail(res, 403, 'bad token');
   }
 
-  // Turnstile human-gate on the valuable endpoints (only when configured).
-  if (TURNSTILE_ON && SENSITIVE_RE.test(p) && !s.human) {
+  // Turnstile human-gate — STEP-UP only, never a blanket wall. A normal visitor
+  // (not suspect, not flagged by the behavioral step-up in trackAndMaybeBan) is
+  // never challenged: the valuable endpoints stay open and the site is instant.
+  // The check engages only for a session that looks automated or is browsing like
+  // a scraper, and it's satisfied by one invisible Turnstile solve. This is the
+  // "doesn't break the site for real users" design: humans pass silently, a plain
+  // HTTP scraper can't solve the challenge and stays locked out of search/title/play.
+  if (SENSITIVE_RE.test(p) && needsHuman(s)) {
     return fail(res, 403, 'verification required', { needVerify: true });
   }
 
@@ -681,7 +726,10 @@ app.get('/api/session', (req, res) => {
   const ts = TURNSTILE_ON ? { enabled: true, sitekey: TS_SITEKEY } : { enabled: false };
   if (!req._zxSess.verified) {
     const bits = powBitsFor(req, req._zxSess);
-    return res.json({ pow: { challenge: issueChallenge(req, bits), bits }, turnstile: ts });
+    // Opaque wire shape (vx.c = challenge, vx.b = difficulty). The names are
+    // deliberately meaningless so the shipped client JS doesn't advertise the
+    // handshake scheme to anyone reading it.
+    return res.json({ vx: { c: issueChallenge(req, bits), b: bits }, turnstile: ts });
   }
   res.json({ token: sec.issuePageToken(req._zxSid, 10 * 60 * 1000, sec.uaKey(req)), turnstile: ts });
 });

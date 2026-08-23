@@ -7,8 +7,9 @@
   const searchClear = $('#searchClear');
   let ZX_TOKEN = null;
   let refreshingToken = null;
+  let ZX_TS_SITEKEY = null;
   const ZX_AUTO = (typeof navigator !== 'undefined' && navigator.webdriver) ? { 'X-ZX-Auto': '1' } : {};
-  const ZX_K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  const _zk = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
     0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
     0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
     0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
@@ -16,7 +17,7 @@
     0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
     0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
-  function zxSha256(msg) {
+  function _za(msg) {
     const rotr = (n, x) => (x >>> n) | (x << (32 - n));
     let H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
     const bytes = [];
@@ -37,7 +38,7 @@
       for (let i = 0; i < 64; i++) {
         const S1 = rotr(6, e) ^ rotr(11, e) ^ rotr(25, e);
         const ch = (e & f) ^ (~e & g);
-        const t1 = (h + S1 + ch + ZX_K[i] + w[i]) | 0;
+        const t1 = (h + S1 + ch + _zk[i] + w[i]) | 0;
         const S0 = rotr(2, a) ^ rotr(13, a) ^ rotr(22, a);
         const maj = (a & b) ^ (a & c) ^ (b & c);
         const t2 = (S0 + maj) | 0;
@@ -50,7 +51,7 @@
     for (let i = 0; i < 8; i++) hex += ((H[i] >>> 0).toString(16)).padStart(8, '0');
     return hex;
   }
-  function zxLzb(hex) {
+  function _zb(hex) {
     let n = 0;
     for (let i = 0; i < hex.length; i++) {
       const v = parseInt(hex[i], 16);
@@ -59,36 +60,37 @@
     }
     return n;
   }
-  function solvePow(challenge, bits) {
+  function _zc(x, y) {
     return new Promise((resolve) => {
-      let nonce = 0;
+      let k = 0;
       const step = () => {
-        const end = nonce + 4096;
-        for (; nonce < end; nonce++) {
-          if (zxLzb(zxSha256(challenge + ':' + nonce)) >= bits) return resolve(nonce);
+        const end = k + 4096;
+        for (; k < end; k++) {
+          if (_zb(_za(x + ':' + k)) >= y) return resolve(k);
         }
         setTimeout(step, 0);
       };
       step();
     });
   }
-  async function doHandshake() {
+  async function _zd() {
     const s = await fetch('/api/session', { credentials: 'same-origin', headers: ZX_AUTO }).then(r => r.json()).catch(() => null);
     if (!s) return null;
     if (s.token) { ZX_TOKEN = s.token; return s; }
-    if (s.pow && s.pow.challenge) {
-      const n = await solvePow(s.pow.challenge, s.pow.bits || 16);
-      const h = await fetch('/api/handshake?c=' + encodeURIComponent(s.pow.challenge) + '&n=' + n, { credentials: 'same-origin', headers: ZX_AUTO }).then(r => r.json()).catch(() => null);
+    if (s.vx && s.vx.c) {
+      const n = await _zc(s.vx.c, s.vx.b || 16);
+      const h = await fetch('/api/handshake?c=' + encodeURIComponent(s.vx.c) + '&n=' + n, { credentials: 'same-origin', headers: ZX_AUTO }).then(r => r.json()).catch(() => null);
       if (h && h.token) ZX_TOKEN = h.token;
     }
     return s;
   }
   function refreshToken() {
     if (refreshingToken) return refreshingToken;
-    refreshingToken = doHandshake().catch(() => null).then(() => { refreshingToken = null; return ZX_TOKEN; });
+    refreshingToken = _zd().catch(() => null).then(() => { refreshingToken = null; return ZX_TOKEN; });
     return refreshingToken;
   }
-  async function api(p, opts, _retried) {
+  async function api(p, opts, tried) {
+    tried = tried || {};
     const o = Object.assign({ credentials: 'same-origin' }, opts || {});
     o.headers = Object.assign({}, ZX_AUTO, o.headers, ZX_TOKEN ? { 'X-ZX-Token': ZX_TOKEN } : {});
     const r = await fetch(p, o);
@@ -105,9 +107,18 @@
       throw new Error('session');
     }
     if (r.status === 403) {
-      if (!_retried) {
+      const body = await r.json().catch(() => null);
+      // Step-up: the server flagged this session for a human check. Solve an
+      // invisible Turnstile challenge once, then retry — a real user sees nothing.
+      if (body && body.needVerify && ZX_TS_SITEKEY && !tried.verify) {
+        tried.verify = true;
+        const ok = await verifyTurnstile(ZX_TS_SITEKEY);
+        if (ok) return api(p, opts, tried);
+      } else if (!tried.token) {
+        // Otherwise treat it as an expired page token: re-handshake and retry once.
+        tried.token = true;
         const t = await refreshToken();
-        if (t) return api(p, opts, true);
+        if (t) return api(p, opts, tried);
       }
       toast('Request blocked', 'warn'); throw new Error('forbidden');
     }
@@ -732,40 +743,58 @@
   }
   async function initSession() {
     try {
-      const s = await doHandshake();
+      const s = await _zd();
       try { sessionStorage.removeItem('zx-reload'); } catch (_) {}
       setInterval(refreshToken, 6 * 60 * 1000);
+      // Remember the Turnstile sitekey but DON'T challenge anyone up front — the
+      // widget is only rendered on demand when a sensitive call returns
+      // {needVerify:true} (step-up). Normal browsing never triggers it.
       if (s && s.turnstile && s.turnstile.enabled && s.turnstile.sitekey) {
-        await verifyTurnstile(s.turnstile.sitekey);
+        ZX_TS_SITEKEY = s.turnstile.sitekey;
       }
     } catch (_) {  }
   }
+  // Render an invisible Turnstile widget on demand and POST the token to /api/verify.
+  // Resolves true only if the server accepted the token (session upgraded to human).
+  // Called from api()'s 403 handler, so it fires solely for stepped-up sessions.
   function verifyTurnstile(sitekey) {
     return new Promise((resolve) => {
-      const done = () => resolve();
+      let settled = false, box = null;
+      const finish = (ok) => {
+        if (settled) return; settled = true;
+        if (box && box.parentNode) box.parentNode.removeChild(box);
+        resolve(!!ok);
+      };
       const render = () => {
-        if (!window.turnstile) return done();
-        let box = document.getElementById('zx-turnstile');
-        if (!box) { box = document.createElement('div'); box.id = 'zx-turnstile'; box.style.display = 'none'; document.body.appendChild(box); }
-        window.turnstile.render(box, {
-          sitekey, size: 'invisible',
-          callback: (token) => {
-            fetch('/api/verify', {
-              method: 'POST', credentials: 'same-origin',
-              headers: Object.assign({ 'content-type': 'application/json', 'X-ZX-Token': ZX_TOKEN || '' }, ZX_AUTO),
-              body: JSON.stringify({ token }),
-            }).then(() => done(), () => done());
-          },
-          'error-callback': done, 'timeout-callback': done,
-        });
+        if (!window.turnstile) return finish(false);
+        box = document.createElement('div');
+        box.id = 'zx-turnstile';
+        box.style.position = 'fixed'; box.style.bottom = '12px'; box.style.right = '12px'; box.style.zIndex = '2147483647';
+        document.body.appendChild(box);
+        try {
+          window.turnstile.render(box, {
+            sitekey, appearance: 'interaction-only',
+            callback: (token) => {
+              fetch('/api/verify', {
+                method: 'POST', credentials: 'same-origin',
+                headers: Object.assign({ 'content-type': 'application/json', 'X-ZX-Token': ZX_TOKEN || '' }, ZX_AUTO),
+                body: JSON.stringify({ token }),
+              })
+                .then(r => (r.ok ? r.json().catch(() => null) : null))
+                .then(j => finish(j && j.ok), () => finish(false));
+            },
+            'error-callback': () => finish(false),
+            'timeout-callback': () => finish(false),
+          });
+        } catch (_) { finish(false); }
       };
       if (window.turnstile) return render();
       const sc = document.createElement('script');
       sc.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
       sc.async = true; sc.defer = true;
-      sc.onload = render; sc.onerror = done;
+      sc.onload = render; sc.onerror = () => finish(false);
       document.head.appendChild(sc);
-      setTimeout(done, 8000);
+      setTimeout(() => finish(false), 12000);
     });
   }
   ZXIcons.apply(document);
