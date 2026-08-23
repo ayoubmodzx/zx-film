@@ -417,7 +417,7 @@
   const P = {
     el: $('#player'), stage: $('#playerStage'), video: $('#video'),
     hls: null, qualities: [], subs: [], ctx: null, def: 'GROOT_LD',
-    seeking: false, hideTimer: null,
+    seeking: false, hideTimer: null, seekHintTimer: null,
   };
   const V = P.video;
   async function openPlayer(ctx) {
@@ -586,7 +586,49 @@
   function togglePlay() { V.paused ? V.play().catch(() => {}) : V.pause(); }
   $('#btnPlay').addEventListener('click', togglePlay);
   $('#plCenter').addEventListener('click', togglePlay);
-  V.addEventListener('click', togglePlay);
+
+  const SEEK_STEP = 10;
+  let lastTap = 0, lastZone = '', tapTimer = null, seekAccum = 0, seekSide = '';
+  function seekHint(side, total) {
+    const h = side === 'R' ? $('#plSeekFwd') : $('#plSeekBack');
+    const other = side === 'R' ? $('#plSeekBack') : $('#plSeekFwd');
+    if (other) other.classList.remove('show');
+    if (!h) return;
+    const em = h.querySelector('em'); if (em) em.textContent = total;
+    h.classList.add('show');
+    clearTimeout(P.seekHintTimer);
+    P.seekHintTimer = setTimeout(() => h.classList.remove('show'), 650);
+  }
+  function skip(side) {
+    if (!V.duration) { togglePlay(); return; }
+    const delta = side === 'R' ? SEEK_STEP : -SEEK_STEP;
+    V.currentTime = Math.min(V.duration - 0.3, Math.max(0, V.currentTime + delta));
+    if (seekSide !== side) seekAccum = 0;
+    seekSide = side; seekAccum += SEEK_STEP;
+    seekHint(side, seekAccum);
+    showUI();
+  }
+  function tapZone(clientX) {
+    const r = P.stage.getBoundingClientRect();
+    const x = clientX - r.left;
+    if (x < r.width * 0.35) return 'L';
+    if (x > r.width * 0.65) return 'R';
+    return 'M';
+  }
+  V.addEventListener('click', (e) => {
+    const now = Date.now();
+    const zone = tapZone(e.clientX);
+    if (now - lastTap < 320 && zone !== 'M' && zone === lastZone) {
+      clearTimeout(tapTimer); tapTimer = null;
+      lastTap = 0;
+      skip(zone);
+      return;
+    }
+    lastTap = now; lastZone = zone;
+    if (zone === 'M') { togglePlay(); return; }
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(() => { tapTimer = null; togglePlay(); }, 280);
+  });
   function setPlayIcons() {
     const ic = V.paused ? 'play' : 'pause';
     $('#btnPlay span').innerHTML = ZXIcons.get(ic);
@@ -620,10 +662,10 @@
     const ratio = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
     if (V.duration) { V.currentTime = ratio * V.duration; $('#seekFill').style.width = (ratio * 100) + '%'; $('#seekKnob').style.left = (ratio * 100) + '%'; $('#tCur').textContent = fmtTime(V.currentTime); }
   }
-  track.addEventListener('pointerdown', (e) => { P.seeking = true; track.setPointerCapture(e.pointerId); seekAt(e.clientX); });
+  track.addEventListener('pointerdown', (e) => { P.seeking = true; track.classList.add('seeking'); try { track.setPointerCapture(e.pointerId); } catch (_) {} seekAt(e.clientX); });
   track.addEventListener('pointermove', (e) => { if (P.seeking) seekAt(e.clientX); });
-  track.addEventListener('pointerup', (e) => { P.seeking = false; try { track.releasePointerCapture(e.pointerId); } catch (_) {} });
-  track.addEventListener('pointercancel', () => { P.seeking = false; });
+  track.addEventListener('pointerup', (e) => { P.seeking = false; track.classList.remove('seeking'); try { track.releasePointerCapture(e.pointerId); } catch (_) {} });
+  track.addEventListener('pointercancel', () => { P.seeking = false; track.classList.remove('seeking'); });
   const vol = $('#volRange');
   vol.addEventListener('input', () => { V.volume = +vol.value; V.muted = (+vol.value === 0); setMuteIcon(); });
   $('#btnMute').addEventListener('click', () => { V.muted = !V.muted; if (!V.muted && V.volume === 0) { V.volume = 1; vol.value = 1; } setMuteIcon(); });

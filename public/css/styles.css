@@ -380,6 +380,17 @@ img { display: block; }
 .pl-center svg { width: 40px; height: 40px; margin-left: 4px; }
 .pl-center.hide { opacity: 0; transform: scale(.8); pointer-events: none; }
 
+/* double-tap seek ripple: a soft pill that flashes on the tapped side */
+.pl-seek-hint { position: absolute; top: 50%; transform: translateY(-50%) scale(.9); z-index: 6;
+  display: flex; align-items: center; gap: 4px; padding: 12px 18px; border-radius: 999px;
+  background: rgba(8,6,15,.5); backdrop-filter: blur(8px); color: #fff; pointer-events: none;
+  font-family: var(--display); font-weight: 600; font-size: 15px; opacity: 0; transition: opacity .18s, transform .18s; }
+.pl-seek-hint.left { left: 7%; }
+.pl-seek-hint.right { right: 7%; }
+.pl-seek-hint.right span { transform: scaleX(-1); }
+.pl-seek-hint svg { width: 20px; height: 20px; }
+.pl-seek-hint.show { opacity: 1; transform: translateY(-50%) scale(1); }
+
 .pl-top { position: absolute; top: 0; left: 0; right: 0; z-index: 7; display: flex; align-items: center; gap: 14px; padding: 18px 20px;
   background: linear-gradient(180deg, rgba(3,2,7,.86), transparent); transition: opacity .3s, transform .3s; }
 .pl-heading { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
@@ -398,12 +409,15 @@ img { display: block; }
 .player.hide-ui .player-stage { cursor: none; }
 
 .pl-seek { padding: 6px 6px 10px; }
-.pl-seek-track { position: relative; height: 6px; border-radius: 6px; background: rgba(255,255,255,.16); cursor: pointer; }
-.pl-seek-track:hover { height: 8px; }
+.pl-seek-track { position: relative; height: 6px; border-radius: 6px; background: rgba(255,255,255,.16); cursor: pointer;
+  touch-action: none; }
+/* enlarge the touch/hit area well beyond the visible 6px bar so a finger can grab it */
+.pl-seek-track::before { content: ""; position: absolute; left: 0; right: 0; top: -14px; bottom: -14px; }
+.pl-seek-track:hover, .pl-seek-track.seeking { height: 8px; }
 .pl-seek-buffer { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: rgba(255,255,255,.22); width: 0; }
 .pl-seek-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: var(--grad); width: 0; box-shadow: 0 0 14px rgba(199,125,255,.8); }
 .pl-seek-knob { position: absolute; top: 50%; width: 15px; height: 15px; border-radius: 50%; background: #fff; transform: translate(-50%, -50%); left: 0; box-shadow: 0 0 0 4px rgba(168,85,247,.45); opacity: 0; transition: opacity .2s; }
-.pl-seek-track:hover .pl-seek-knob { opacity: 1; }
+.pl-seek-track:hover .pl-seek-knob, .pl-seek-track.seeking .pl-seek-knob { opacity: 1; }
 
 .pl-row { display: flex; align-items: center; gap: 6px; padding: 0 4px; }
 .pl-spacer { flex: 1; }
@@ -547,6 +561,11 @@ img { display: block; }
   .pl-time { font-size: 12px; }
   .pl-row { gap: 2px; }
   .pl-vol:hover .vol-range { width: 60px; }
+  /* touch: shrink the center button, always show the seek knob, fatten the bar */
+  .pl-center { width: 72px; height: 72px; }
+  .pl-center svg { width: 32px; height: 32px; }
+  .pl-seek-track { height: 7px; }
+  .pl-seek-knob { width: 17px; height: 17px; opacity: 1; }
 }
 @media (max-width: 480px) {
   /* compact header: the logo mark, wordmark and search all shrink so the two-row
@@ -564,6 +583,8 @@ img { display: block; }
   .icon-btn svg { width: 20px; height: 20px; }
   .quality-btn em { display: none; }
   .pl-controls { padding: 26px 10px 12px; }
+  .pl-center { width: 62px; height: 62px; }
+  .pl-center svg { width: 27px; height: 27px; }
 }
 
 /* ---- support overlay ------------------------------------------------------- */
