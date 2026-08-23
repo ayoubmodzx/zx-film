@@ -385,6 +385,14 @@ function siteHost(req) {
   if (SITE_HOST) return SITE_HOST;
   return String(req.headers['x-forwarded-host'] || req.headers.host || '').split(':')[0].toLowerCase();
 }
+// Turnstile can't validate a loopback host (localhost / 127.0.0.1 isn't a real
+// widget hostname), so a step-up challenge there is unsatisfiable and would brick
+// local + preview use. Production clients never reach the origin over loopback,
+// so waiving the Turnstile step-up for loopback is safe and only helps dev.
+function isLoopbackHost(req) {
+  const h = siteHost(req);
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
 // A browser-based clone calling our API from its own page sends ITS origin (which
 // JS can't forge), and a SameSite=Strict cookie isn't sent cross-site at all — so
 // this check plus the cookie kills third-party sites embedding our API.
@@ -513,7 +521,7 @@ function apiGate(req, res, next) {
   // a scraper, and it's satisfied by one invisible Turnstile solve. This is the
   // "doesn't break the site for real users" design: humans pass silently, a plain
   // HTTP scraper can't solve the challenge and stays locked out of search/title/play.
-  if (SENSITIVE_RE.test(p) && needsHuman(s)) {
+  if (SENSITIVE_RE.test(p) && needsHuman(s) && !isLoopbackHost(req)) {
     return fail(res, 403, 'verification required', { needVerify: true });
   }
 
@@ -835,7 +843,7 @@ app.get('/api/title/:id', async (req, res) => {
       name: e.name || '',
       totalTime: e.totalTime || 0,
       viewable: e.viewable !== false,
-    }));
+    })).sort((a, b) => a.seriesNo - b.seriesNo);
     res.json({
       id: String(id),
       category: det._category != null ? det._category : category,

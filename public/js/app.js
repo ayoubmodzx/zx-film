@@ -346,7 +346,7 @@
             ${tags ? `<div class="tags">${tags}</div>` : ''}
             <p class="detail-desc">${esc(d.intro || 'No description available.')}</p>
             <div class="detail-actions">
-              <button class="btn" data-play-ep="${eps[0] ? esc(eps[0].episodeId) : ''}" data-no="${eps[0] ? esc(eps[0].seriesNo) : 1}">
+              <button class="btn" data-play-ep="${eps[0] ? esc(eps[0].episodeId) : ''}" data-no="${isSeries && eps[0] ? esc(eps[0].seriesNo) : ''}">
                 ${ZXIcons.get('play')} ${isSeries ? 'Play Episode 1' : 'Play Now'}
               </button>
             </div>
@@ -426,7 +426,7 @@
     P.el.hidden = false; document.body.style.overflow = 'hidden';
     showUI(); $('#plLoading').hidden = false;
     $('#plTitle').textContent = ctx.name || 'Now Playing';
-    $('#plSub').textContent = ctx.epNo ? `Episode ${ctx.epNo}` : '';
+    $('#plSub').textContent = (ctx.epNo && ctx.epNo !== '0') ? `Episode ${ctx.epNo}` : '';
     clearTracks();
     await loadPlay(ctx.def || 'GROOT_LD', 0, true);
   }
@@ -501,7 +501,11 @@
     $('#qualLabel').textContent = q ? q.label : 'Auto';
     $$('#popQual .pl-opt').forEach(o => o.classList.toggle('active', +o.dataset.idx === act));
   }
-  function clearTracks() { $$('#video track').forEach(t => t.remove()); }
+  function clearTracks() {
+    $$('#video track').forEach(t => t.remove());
+    if (P.subTrack) { try { P.subTrack.removeEventListener('cuechange', renderCue); } catch (_) {} P.subTrack = null; }
+    const box = $('#plSubs'); if (box) { box.hidden = true; box.textContent = ''; }
+  }
   function buildSubs() {
     clearTracks();
     P.subs.forEach((s, i) => {
@@ -518,8 +522,42 @@
   }
   function selectSub(idx) {
     const tracks = V.textTracks;
-    for (let i = 0; i < tracks.length; i++) tracks[i].mode = (i === idx) ? 'showing' : 'disabled';
+    if (P.subTrack) { try { P.subTrack.removeEventListener('cuechange', renderCue); } catch (_) {} P.subTrack = null; }
+    for (let i = 0; i < tracks.length; i++) tracks[i].mode = (i === idx) ? 'hidden' : 'disabled';
+    if (idx >= 0 && tracks[idx]) { P.subTrack = tracks[idx]; P.subTrack.addEventListener('cuechange', renderCue); }
+    renderCue();
     $$('#popSubs .pl-opt').forEach(o => o.classList.toggle('active', (+o.dataset.sub) === idx));
+  }
+  function renderCue() {
+    const box = $('#plSubs'); if (!box) return;
+    const tr = P.subTrack;
+    let txt = '';
+    if (tr && tr.activeCues) {
+      for (let i = 0; i < tr.activeCues.length; i++) { if (txt) txt += '\n'; txt += tr.activeCues[i].text || ''; }
+    }
+    txt = txt.replace(/<[^>]+>/g, '').trim();
+    if (!txt) { box.hidden = true; box.textContent = ''; return; }
+    box.innerHTML = txt.split('\n').map(l => l.trim()).filter(Boolean).map(l => '<span>' + esc(l) + '</span>').join('');
+    box.hidden = false;
+    positionSubs();
+  }
+  function positionSubs() {
+    const box = $('#plSubs'); if (!box || box.hidden) return;
+    const cw = P.stage.clientWidth, ch = P.stage.clientHeight;
+    let bar = 0;
+    if (V.videoWidth && V.videoHeight && cw && ch) {
+      const picH = Math.min(ch, cw * V.videoHeight / V.videoWidth);
+      bar = Math.max(0, (ch - picH) / 2);
+    }
+    let bottom = Math.round(bar + ch * 0.04) + 6;
+    if (!P.el.classList.contains('hide-ui')) {
+      const ctrls = $('#plControls');
+      const need = (ctrls ? ctrls.offsetHeight : 0) + 8;
+      if (bottom < need) bottom = need;
+    }
+    const cap = Math.round(ch * 0.6);
+    if (bottom > cap) bottom = cap;
+    box.style.bottom = bottom + 'px';
   }
   function togglePop(which) {
     const q = $('#popQual'), s = $('#popSubs');
@@ -601,10 +639,14 @@
     const on = !!document.fullscreenElement;
     P.stage.classList.toggle('fs', on);
     $('#btnFull span').innerHTML = ZXIcons.get(on ? 'exitfull' : 'fullscreen');
+    setTimeout(positionSubs, 60);
   });
-  function showUI() { P.el.classList.remove('hide-ui'); clearTimeout(P.hideTimer); P.hideTimer = setTimeout(() => { if (!V.paused && !$('#popQual').hidden === false) P.el.classList.add('hide-ui'); }, 3000); }
+  window.addEventListener('resize', positionSubs);
+  window.addEventListener('orientationchange', () => setTimeout(positionSubs, 250));
+  V.addEventListener('loadedmetadata', positionSubs);
+  function showUI() { P.el.classList.remove('hide-ui'); positionSubs(); clearTimeout(P.hideTimer); P.hideTimer = setTimeout(() => { if (!V.paused && !$('#popQual').hidden === false) { P.el.classList.add('hide-ui'); positionSubs(); } }, 3000); }
   P.stage.addEventListener('pointermove', showUI);
-  P.stage.addEventListener('pointerleave', () => { if (!V.paused) P.el.classList.add('hide-ui'); });
+  P.stage.addEventListener('pointerleave', () => { if (!V.paused) { P.el.classList.add('hide-ui'); positionSubs(); } });
   V.addEventListener('pause', () => { P.el.classList.remove('hide-ui'); clearTimeout(P.hideTimer); });
   $('#plBack').addEventListener('click', () => closePlayer());
   function closePlayer(silent) {

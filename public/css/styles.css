@@ -354,6 +354,20 @@ img { display: block; }
 #video { width: 100%; height: 100%; background: #000; display: block; }
 #video::cue { background: rgba(4,2,9,.78); color: #fff; font-family: var(--font); font-size: .92em; line-height: 1.35; padding: 2px 6px; border-radius: 4px; }
 
+/* Subtitles are rendered by us (track mode = hidden), not the browser: native
+   ::cue sits at the bottom of the <video> box, which on a letterboxed portrait /
+   fullscreen view lands far below the picture. This overlay is pinned by JS to the
+   lower edge of the actual image (see positionSubs) so it reads inside the film. */
+.pl-subs { position: absolute; left: 0; right: 0; bottom: 12%; z-index: 6;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 0 8%; text-align: center; pointer-events: none;
+  transition: bottom .2s var(--ease); }
+.pl-subs[hidden] { display: none; }
+.pl-subs span { display: inline-block; max-width: 100%; background: rgba(4,2,9,.82); color: #fff;
+  font-family: var(--font); font-size: clamp(15px, 2.5vw, 23px); line-height: 1.35; font-weight: 500;
+  padding: 2px 9px; border-radius: 6px; text-shadow: 0 1px 3px rgba(0,0,0,.7);
+  -webkit-box-decoration-break: clone; box-decoration-break: clone; }
+
 .pl-loading { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; z-index: 5; }
 .pl-loading[hidden] { display: none; }
 .ring { width: 58px; height: 58px; border-radius: 50%; border: 3px solid rgba(168,85,247,.22); border-top-color: var(--surge); animation: spin .9s linear infinite; box-shadow: var(--glow); }
