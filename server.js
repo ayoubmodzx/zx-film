@@ -18,6 +18,7 @@ const express = require('express');
 const { LoklokClient, loadToken, DEFINITION_LABELS } = require('./lib/loklok');
 const { TokenManager } = require('./lib/auth');
 const sec = require('./lib/security');
+const mb = require('./lib/movibox'); // MovieBox ("ZX 2") content source
 
 const PORT = process.env.PORT || 7817;
 
@@ -178,7 +179,9 @@ const apiLimiter = rateLimiter(RL_WINDOW, Number(process.env.RL_API || 120));
 const mediaLimiter = rateLimiter(RL_WINDOW, Number(process.env.RL_MEDIA || 1200));
 app.use('/api', (req, res, next) => {
   const p = (req.originalUrl || '').split('?')[0];
-  const isMedia = p.startsWith('/api/hls') || p.startsWith('/api/sub');
+  // hls/sub (Loklok) and mbmpd/mbseg (MovieBox DASH) all pull many segments —
+  // give them the high-ceiling media limiter, not the tight JSON API one.
+  const isMedia = MEDIA_RE.test(p);
   return (isMedia ? mediaLimiter : apiLimiter)(req, res, next);
 });
 app.use('/api', apiGate); // session/origin/token/pattern gate (defined below)
@@ -358,25 +361,34 @@ if (hlsSweep.unref) hlsSweep.unref();
 // reuse one entry and just slide its expiry, so a long VOD can't balloon the map
 // with duplicate handles. Bound to sid + UA fingerprint: worthless cross-session
 // and can't be replayed from a client presenting a different UA.
-function mintToken(map, ttl, u, sid, ua) {
+// anyHost: MovieBox ("ZX 2") streams live on CDN hosts the API only reveals at
+// runtime (bcdn/vcdn/… across several domains), so those handles skip the static
+// host allow-list — safe because the client never supplies the url (only an
+// opaque handle), the server mints it solely from an authenticated upstream
+// response, and the proxy still applies an SSRF guard (see safeProxyTarget).
+// cookie: some MovieBox CDN urls (unsigned macdn/*.mp4) only return the real file
+// when the CloudFront sign cookie from play-info is sent as a Cookie header; the
+// proxy attaches it. Stored with the handle so the client never sees it.
+function mintToken(map, ttl, u, sid, ua, anyHost, cookie) {
   const id = sec.hmac(['t', sid, ua || '', u].join('|')).replace(/[^A-Za-z0-9]/g, '').slice(0, 32);
   const exp = Date.now() + ttl;
   const ex = map.get(id);
-  if (ex) { ex.exp = exp; return id; }
-  map.set(id, { u, sid, ua: ua || '', exp });
+  if (ex) { ex.exp = exp; if (cookie) ex.cookie = cookie; return id; }
+  map.set(id, { u, sid, ua: ua || '', exp, anyHost: !!anyHost, cookie: cookie || '' });
   return id;
 }
-function mintHls(u, sid, ua) { return mintToken(hlsTokens, HLS_TTL, u, sid, ua); }
-function mintSub(u, sid, ua) { return mintToken(subTokens, SUB_TTL, u, sid, ua); }
+function mintHls(u, sid, ua, anyHost, cookie) { return mintToken(hlsTokens, HLS_TTL, u, sid, ua, anyHost, cookie); }
+function mintSub(u, sid, ua, anyHost, cookie) { return mintToken(subTokens, SUB_TTL, u, sid, ua, anyHost, cookie); }
 function dropSessionTokens(sid) {
   for (const [id, t] of hlsTokens) if (t.sid === sid) hlsTokens.delete(id);
   for (const [id, t] of subTokens) if (t.sid === sid) subTokens.delete(id);
+  if (typeof dropSessionDash === 'function') dropSessionDash(sid);
 }
 
 // ---- gate internals --------------------------------------------------------
 const API_OPEN = new Set(['/api/health']);          // no gate at all
-const MEDIA_RE = /^\/api\/(hls|sub)/;               // origin-lenient, token not required
-const SENSITIVE_RE = /^\/api\/(search|title|play)/; // gated behind Turnstile human-check when enabled
+const MEDIA_RE = /^\/api\/(hls|sub|mbmpd|mbseg)/;    // origin-lenient, token not required
+const SENSITIVE_RE = /^\/api\/(mb\/)?(search|title|play)/; // gated behind Turnstile human-check when enabled
 // Obvious non-browser clients. A speed bump, not a wall (UA is trivially spoofed);
 // the cookie+token+Turnstile layers are what actually cost a scraper.
 const BAD_UA = /(python-requests|python-urllib|aiohttp|httpx|scrapy|libwww|Go-http-client|java\/|curl\/|wget|node-fetch|axios\/|Postman|Insomnia|HeadlessChrome|PhantomJS|Bytespider|MJ12bot|AhrefsBot|SemrushBot|DotBot)/i;
@@ -411,11 +423,11 @@ function originOk(req) {
 function trackAndMaybeBan(s, req, p) {
   const now = Date.now();
   if (now - s.idsWindowStart > 5 * 60 * 1000) { s.ids = new Set(); s.idsWindowStart = now; }
-  if (/^\/api\/(title|play)/.test(p)) {
-    const m = p.match(/^\/api\/title\/([^/]+)/);
+  if (/^\/api\/(mb\/)?(title|play)/.test(p)) {
+    const m = p.match(/^\/api\/(?:mb\/)?title\/([^/]+)/);
     const id = (m && m[1]) || req.query.contentId || req.query.id || '';
     if (id) s.ids.add(String(id));
-  } else if (p === '/api/search') {
+  } else if (p === '/api/search' || p === '/api/mb/search') {
     // Search is a catalog-walking vector too: a metadata scraper enumerates keywords
     // to harvest ids/covers without ever touching /api/title. Count each distinct
     // query toward the same enumeration budget so broad keyword-walking trips the ban.
@@ -525,7 +537,12 @@ function apiGate(req, res, next) {
     return fail(res, 403, 'verification required', { needVerify: true });
   }
 
-  if (trackAndMaybeBan(s, req, p)) {
+  // Enumeration/burst ban tracking is for the JSON API only. Media segments
+  // (HLS/DASH) legitimately fire many requests per minute — an adaptive stream
+  // can pull dozens of /api/hls|mbseg segments while buffering — so counting
+  // them would ban a normal viewer mid-playback. Media has its own high-ceiling
+  // rate limiter (mediaLimiter) and session-bound ?t= tokens already.
+  if (!isMedia && trackAndMaybeBan(s, req, p)) {
     res.set('Retry-After', String(Math.ceil((s.bannedUntil - Date.now()) / 1000)));
     return fail(res, 429, 'temporarily blocked');
   }
@@ -931,7 +948,8 @@ app.get('/api/sub', async (req, res) => {
   let target;
   try { target = new URL(rec.u); } catch (_) { return fail(res, 400, 'bad url'); }
   if (!/^https?:$/.test(target.protocol)) return fail(res, 400, 'bad url');
-  if (!/(^|\.)despseek\.com$/i.test(target.host)) return fail(res, 403, 'host not allowed');
+  if (rec.anyHost ? !safeProxyHost(target.hostname) : !HLS_HOST_RE.test(target.host))
+    return fail(res, 403, 'host not allowed');
   try {
     const r = await fetch(target.toString(), { headers: { 'user-agent': 'okhttp/4.12.0' } });
     if (!r.ok) return fail(res, 502, 'subtitle fetch failed', { status: r.status });
@@ -954,7 +972,31 @@ app.get('/api/sub', async (req, res) => {
 // URI is re-issued as an opaque, session-bound ?t= handle (same as /api/play),
 // so no raw CDN host/hdntl token ever reaches the client.
 const OKHTTP_UA = 'okhttp/4.12.0';
-const HLS_HOST_RE = /(^|\.)despseek\.com$/i;
+// Loklok streams live on despseek.com; MovieBox ("ZX 2") media lives on the Movi
+// CDN families — hakunaymatata.com (bcdn/sacdn/cacdn) and shalltry.com (dsu-a /
+// ire-dsu). All are proxied server-side with the app UA so the CDN (which 403s
+// browser-origin requests) serves them, and no raw CDN host reaches the client.
+// The proxy is still gated by session+UA-bound ?t= handles the server itself
+// mints from upstream responses, so this allow-list is defence-in-depth.
+const HLS_HOST_RE = /(^|\.)(despseek\.com|hakunaymatata\.com|shalltry\.com)$/i;
+
+// SSRF guard for the anyHost (MovieBox) proxy path: require https and refuse any
+// loopback / link-local / private-range literal so a handle can never be turned
+// into a request against the origin's own network. Public CDN hostnames pass.
+function safeProxyHost(host) {
+  const h = String(host || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return false;
+  if (h === 'localhost' || h.endsWith('.localhost')) return false;
+  if (h === '::1' || h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return false;
+  // IPv4 literal in a private / loopback / link-local range?
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    if (a === 10 || a === 127 || a === 0 || (a === 192 && b === 168) ||
+        (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254) || a >= 224) return false;
+  }
+  return true;
+}
 
 function proxifyUri(uri, baseUrl, parentSearch, sid, ua) {
   let abs;
@@ -992,10 +1034,12 @@ app.get('/api/hls', async (req, res) => {
   let target;
   try { target = new URL(rec.u); } catch (_) { return fail(res, 400, 'bad url'); }
   if (!/^https?:$/.test(target.protocol)) return fail(res, 400, 'bad url');
-  if (!HLS_HOST_RE.test(target.host)) return fail(res, 403, 'host not allowed');
+  if (rec.anyHost ? !safeProxyHost(target.hostname) : !HLS_HOST_RE.test(target.host))
+    return fail(res, 403, 'host not allowed');
 
   const headers = { 'user-agent': OKHTTP_UA, accept: '*/*' };
   if (req.headers.range) headers.range = req.headers.range; // segment seeking
+  if (rec.cookie) headers.cookie = rec.cookie; // CloudFront sign cookie (MovieBox)
 
   // Abort the upstream fetch if it stalls, or when the browser disconnects (seek/
   // close) — without this a dropped client leaks a hung upstream socket.
@@ -1055,11 +1099,419 @@ app.get('/api/hls', async (req, res) => {
   }
 });
 
+// ---- DASH proxy (MovieBox series) ------------------------------------------
+// Series on MovieBox stream only as DASH (.mpd, usually HEVC) behind a
+// CloudFront cookie. dash.js in the browser plays them, but it fetches the
+// manifest + every segment itself, and those hit the CDN which 403s browser
+// requests and needs the cookie. So we proxy: /api/mbmpd fetches the manifest
+// (with cookie + app UA) and injects a <BaseURL> that routes every segment back
+// through /api/mbseg, which re-attaches the cookie/UA. Handles are session+UA
+// bound, exactly like /api/hls, and dash.js sends no page token (these paths are
+// in MEDIA_RE). Both are cleaned up with the session.
+const dashTokens = new Map(); // id -> { mpd?, base?, cookie, sid, ua, exp }
+const dashSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [id, t] of dashTokens) if (now > t.exp) dashTokens.delete(id);
+}, 60 * 1000);
+if (dashSweep.unref) dashSweep.unref();
+function mintDash(rec) {
+  const id = sec.newSid();
+  dashTokens.set(id, { ...rec, exp: Date.now() + HLS_TTL });
+  return id;
+}
+
+app.get('/api/mbmpd', async (req, res) => {
+  const rec = req.query.t ? dashTokens.get(String(req.query.t)) : null;
+  if (!rec || !rec.mpd) return fail(res, 403, 'forbidden');
+  if (Date.now() > rec.exp) { dashTokens.delete(String(req.query.t)); return fail(res, 403, 'expired'); }
+  if (rec.sid !== req._zxSid || rec.ua !== sec.uaKey(req)) return fail(res, 403, 'forbidden');
+  let target;
+  try { target = new URL(rec.mpd); } catch (_) { return fail(res, 400, 'bad url'); }
+  if (!safeProxyHost(target.hostname)) return fail(res, 403, 'host not allowed');
+  const headers = { 'user-agent': OKHTTP_UA, accept: '*/*' };
+  if (rec.cookie) headers.cookie = rec.cookie;
+  try {
+    const up = await fetch(target.toString(), { headers });
+    if (!up.ok) return fail(res, 502, 'manifest upstream', { status: up.status });
+    let xml = await up.text();
+    // Absolute directory the manifest's relative segment paths resolve against.
+    const base = target.toString().replace(/[^/]*(\?.*)?$/, '');
+    const segTok = mintDash({ base, cookie: rec.cookie, sid: rec.sid, ua: rec.ua });
+    const proxyBase = '/api/mbseg/' + segTok + '/';
+    // Drop any manifest-declared BaseURL and force ours so every segment/init
+    // URL routes back through the segment proxy.
+    xml = xml.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
+    xml = xml.replace(/(<MPD\b[^>]*>)/i, '$1<BaseURL>' + proxyBase + '</BaseURL>');
+    res.set('Content-Type', 'application/dash+xml; charset=utf-8');
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Cache-Control', 'no-cache');
+    res.send(xml);
+  } catch (e) {
+    oops(res, 502, 'manifest unavailable', e);
+  }
+});
+
+app.get(/^\/api\/mbseg\/([^/]+)\/(.*)$/, async (req, res) => {
+  const rec = dashTokens.get(String(req.params[0]));
+  const rest = req.params[1] || '';
+  if (!rec || !rec.base) return fail(res, 403, 'forbidden');
+  if (Date.now() > rec.exp) { dashTokens.delete(String(req.params[0])); return fail(res, 403, 'expired'); }
+  if (rec.sid !== req._zxSid || rec.ua !== sec.uaKey(req)) return fail(res, 403, 'forbidden');
+  rec.exp = Date.now() + HLS_TTL; // sliding
+  const qs = (req.originalUrl.split('?')[1] ? '?' + req.originalUrl.split('?')[1] : '');
+  let target;
+  try { target = new URL(rec.base + rest + qs); } catch (_) { return fail(res, 400, 'bad url'); }
+  if (!safeProxyHost(target.hostname)) return fail(res, 403, 'host not allowed');
+  const headers = { 'user-agent': OKHTTP_UA, accept: '*/*' };
+  if (req.headers.range) headers.range = req.headers.range;
+  if (rec.cookie) headers.cookie = rec.cookie;
+  const ac = new AbortController();
+  const killTimer = setTimeout(() => ac.abort(), 30_000);
+  const onClose = () => ac.abort();
+  res.on('close', onClose);
+  const cleanup = () => { clearTimeout(killTimer); res.off('close', onClose); };
+  let up;
+  try { up = await fetch(target.toString(), { headers, signal: ac.signal }); }
+  catch (e) { cleanup(); return oops(res, 502, 'segment unavailable', e); }
+  if (!up.ok && up.status !== 206) { cleanup(); return fail(res, 502, 'segment upstream', { status: up.status }); }
+  res.status(up.status);
+  res.set('Access-Control-Allow-Origin', '*');
+  const ct = up.headers.get('content-type');
+  if (ct) res.set('Content-Type', ct);
+  for (const h of ['content-length', 'content-range', 'accept-ranges']) {
+    const v = up.headers.get(h); if (v) res.set(h, v);
+  }
+  res.set('Cache-Control', 'public, max-age=86400');
+  if (up.body) {
+    const src = Readable.fromWeb(up.body);
+    src.on('error', (e) => { cleanup(); if (!res.headersSent) fail(res, 502, 'segment error'); else res.destroy(e); });
+    res.on('error', () => { try { src.destroy(); } catch (_) {} });
+    src.on('end', cleanup);
+    src.pipe(res);
+  } else {
+    try { res.end(Buffer.from(await up.arrayBuffer())); }
+    catch (e) { if (!res.headersSent) oops(res, 502, 'segment unavailable', e); }
+    finally { cleanup(); }
+  }
+});
+function dropSessionDash(sid) { for (const [id, t] of dashTokens) if (t.sid === sid) dashTokens.delete(id); }
+
+// ============================================================================
+// MovieBox ("ZX 2") — a second content source, same UI. Mirrors the Loklok
+// /api/* endpoints under /api/mb/* so the SPA just swaps a path prefix. Browse /
+// detail / play work signature-only (no account); keyword search self-heals a
+// throwaway account (kept on purpose). Streams are proxied through /api/hls and
+// subtitles through /api/sub, exactly like Loklok, so the client never sees a
+// raw CDN url. See lib/movibox.js.
+// ============================================================================
+
+// Localization tags the catalog appends to titles, e.g. "The Runner[مدبلج
+// للعربية]" or "Prison Break [Version française]" — strip for display.
+function mbClean(s) {
+  return String(s || '').replace(/\s*[\[(][^\])]*[\])]\s*$/u, '').trim() || String(s || '').trim();
+}
+// subjectType: 1 movie, 2 TV/series, 7 short-drama, 9 clips/other.
+function mbType(t) {
+  const n = Number(t);
+  if (n === 2 || n === 7) return 'Series';
+  return 'Movie';
+}
+function mbCard(s) {
+  const rd = String(s.releaseDate || '');
+  return {
+    id: String(s.subjectId),
+    name: mbClean(s.title),
+    type: mbType(s.subjectType),
+    cover: s.cover || '',
+    backdrop: s.cover || '',
+    year: (rd.match(/\d{4}/) || [''])[0],
+    score: normScore(s.imdb),
+    episodes: null,
+    intro: '',
+    category: 0, // se; the SPA echoes it back, /api/mb/play derives se/ep from episodeId
+  };
+}
+
+app.get('/api/mb/home', async (req, res) => {
+  try {
+    // Every MovieBox endpoint needs an account token; acquire (or self-heal) it
+    // ONCE here so the parallel browse calls below all reuse the cached one
+    // instead of each racing into a fresh registration.
+    await mb.ensureToken().catch(() => null);
+    // Two pages of the operating page give a good spread of curated rows.
+    const pages = await Promise.all([
+      mb.tabOperatingPage({ tabId: 0, pageNum: 1, pageSize: 8 }).catch(() => null),
+      mb.tabOperatingPage({ tabId: 0, pageNum: 2, pageSize: 8 }).catch(() => null),
+    ]);
+    const sections = [];
+    const seenTitles = new Set();
+    for (const data of pages) {
+      const items = (data && data.items) || [];
+      for (const it of items) {
+        // Only the clean poster rows — skip banners, filters, clip/CUSTOM rails.
+        if (it.type !== 'SUBJECTS_MOVIE') continue;
+        const subs = (it.subjects || []).filter(s => s && s.subjectId && s.cover && s.cover.url);
+        if (!subs.length) continue;
+        const title = String(it.title || '').trim() || 'Featured';
+        if (seenTitles.has(title.toLowerCase())) continue;
+        seenTitles.add(title.toLowerCase());
+        sections.push({
+          title,
+          items: subs.slice(0, 18).map(s => mbCard({
+            subjectId: s.subjectId, title: s.title, subjectType: s.subjectType,
+            releaseDate: s.releaseDate, imdb: s.imdbRatingValue || s.imdbRate, cover: s.cover.url,
+          })),
+        });
+        if (sections.length >= 10) break;
+      }
+      if (sections.length >= 10) break;
+    }
+    res.json({ sections });
+  } catch (e) {
+    oops(res, 502, 'home unavailable', e);
+  }
+});
+
+app.get('/api/mb/search', async (req, res) => {
+  const raw = String(req.query.q || '').slice(0, 80).trim();
+  if (!raw) return res.json({ query: '', results: [], rawCount: 0 });
+  try {
+    // perPage caps at 20 upstream, so pull several pages and merge to match the
+    // app's fuller result list (e.g. all the Spider-Man titles, not just 20).
+    await mb.ensureToken().catch(() => null);
+    const pages = await Promise.all([1, 2, 3].map(p =>
+      mb.search(raw, { page: p, perPage: 20 }).catch(() => null)));
+    const seen = new Set();
+    const subs = [];
+    for (const data of pages) {
+      for (const s of mb.extractSubjects(data)) {
+        if (s.subjectId && s.cover && !seen.has(s.subjectId)) { seen.add(s.subjectId); subs.push(s); }
+      }
+    }
+    if (subs.length) {
+      return res.json({ query: raw, results: subs.map(mbCard), rawCount: subs.length });
+    }
+    // Nothing matched — show a popular rail from the home rows, like ZX 1 does.
+    const home = await mb.tabOperatingPage({ tabId: 0, pageNum: 2, pageSize: 8 }).catch(() => null);
+    const rec = [];
+    for (const it of ((home && home.items) || [])) {
+      if (it.type !== 'SUBJECTS_MOVIE') continue;
+      for (const s of (it.subjects || [])) {
+        if (s && s.subjectId && s.cover && s.cover.url && rec.length < 18)
+          rec.push(mbCard({ subjectId: s.subjectId, title: s.title, subjectType: s.subjectType,
+            releaseDate: s.releaseDate, imdb: s.imdbRatingValue || s.imdbRate, cover: s.cover.url }));
+      }
+    }
+    res.json({ query: raw, results: rec, rawCount: 0, recommended: true });
+  } catch (e) {
+    oops(res, 502, 'search unavailable', e);
+  }
+});
+
+// MovieBox ids are numeric strings; keep them short-slug safe.
+const MB_ID_RE = /^[0-9]{1,32}$/;
+function badMbId(v) { return v == null || !MB_ID_RE.test(String(v)); }
+
+app.get('/api/mb/title/:id', async (req, res) => {
+  const id = req.params.id;
+  if (badMbId(id)) return fail(res, 400, 'bad id');
+  try {
+    await mb.ensureToken().catch(() => null);
+    const [d, seas] = await Promise.all([
+      mb.subjectGet(id, { se: 0 }),
+      mb.seasonInfo(id).catch(() => null),
+    ]);
+    if (!d || typeof d !== 'object') return fail(res, 404, 'title not found');
+    const seasons = (seas && seas.seasons) || [];
+    const isSeries = mbType(d.subjectType) === 'Series' || seasons.some(s => Number(s.maxEp) > 1);
+    const episodes = [];
+    if (isSeries) {
+      // Flatten seasons -> a single episode list; episodeId encodes "se_ep" so
+      // /api/mb/play can recover both without a title-level season field.
+      let running = 0;
+      for (const s of seasons) {
+        const se = Number(s.se) || 0;
+        const maxEp = Math.max(1, Number(s.maxEp) || 0);
+        for (let ep = 1; ep <= maxEp; ep++) {
+          running++;
+          episodes.push({
+            episodeId: se + '_' + ep,
+            seriesNo: seasons.length > 1 ? running : ep,
+            name: seasons.length > 1 ? ('S' + se + 'E' + ep) : '',
+            totalTime: 0,
+            viewable: true,
+          });
+        }
+      }
+    }
+    const genre = String(d.genre || '').split(/[,،]/).map(x => x.trim()).filter(Boolean);
+    const rd = String(d.releaseDate || '');
+    res.json({
+      id: String(id),
+      category: 0,
+      name: mbClean(d.title),
+      enName: '',
+      year: (rd.match(/\d{4}/) || [''])[0],
+      type: mbType(d.subjectType),
+      cover: (d.cover && d.cover.url) || '',
+      backdrop: (d.cover && d.cover.url) || '',
+      intro: d.description || '',
+      tags: genre.slice(0, 6),
+      areas: d.countryName ? [d.countryName] : [],
+      score: normScore(d.imdbRatingValue),
+      episodeCount: isSeries ? episodes.length : 1,
+      episodes,
+    });
+  } catch (e) {
+    oops(res, 502, 'title unavailable', e);
+  }
+});
+
+// Pick one playable .mp4 per resolution, preferring browser-friendly H.264 over
+// HEVC and always requiring a non-empty signed link.
+//
+// MovieBox slips a ~20s "Installation Failed — download the latest version"
+// promo into the resource list (often as the top-resolution entry, to bait the
+// picker). It's far shorter than the real film, so we drop any entry whose
+// duration is a tiny fraction of the longest one — that removes the ad/preview
+// while keeping the genuine full-length uploads. If everything is short (a truly
+// VIP-locked title that only exposes the promo), nothing survives and the caller
+// reports it unavailable rather than playing the ad as if it were the film.
+function mbPickResources(list) {
+  // Only self-signed links (…?sign=…&t=…) are playable as-is. Unsigned CDN urls
+  // (e.g. macdn.aoneroom.com/other/*.mp4) return a ~20s promo unless the play-info
+  // CloudFront cookie is attached, so we don't treat those as direct sources —
+  // the caller falls back to the play-info stream+cookie for them.
+  const withLink = (list || []).filter(r => r && r.resourceLink && /[?&]sign=/.test(r.resourceLink));
+  const maxDur = withLink.reduce((m, r) => Math.max(m, Number(r.duration) || 0), 0);
+  const real = withLink.filter(r => {
+    const d = Number(r.duration) || 0;
+    if (maxDur >= 120 && d > 0 && d < 60 && d < maxDur * 0.3) return false; // promo/preview clip
+    return true;
+  });
+  const byRes = new Map();
+  for (const r of real) {
+    const res = Number(r.resolution) || 0;
+    const codec = String(r.codecName || '').toLowerCase();
+    const h264 = codec === 'h264' || codec === 'avc';
+    const prev = byRes.get(res);
+    if (!prev) byRes.set(res, { res, codec, link: r.resourceLink, h264 });
+    else if (!prev.h264 && h264) byRes.set(res, { res, codec, link: r.resourceLink, h264 });
+  }
+  return [...byRes.values()].sort((a, b) => b.res - a.res);
+}
+
+app.get('/api/mb/play', async (req, res) => {
+  const subjectId = req.query.contentId;
+  if (badMbId(subjectId)) return fail(res, 400, 'contentId required');
+  // episodeId encodes "se_ep" (movies: absent -> 0_0).
+  let se = 0, ep = 0;
+  const epRaw = String(req.query.episodeId || '');
+  const m = epRaw.match(/^(\d+)_(\d+)$/);
+  if (m) { se = Number(m[1]); ep = Number(m[2]); }
+  const want = String(req.query.definition || '');
+  try {
+    await mb.ensureToken().catch(() => null);
+    // resource/v2 indexes from 1 (movies report season 0 but still live at se=1).
+    const rse = se > 0 ? se : 1;
+    const rep = ep > 0 ? ep : 1;
+    // A transient upstream hiccup on resource/v2 must not sink playback — series
+    // don't need it at all (DASH comes from play-info). Try twice, then continue.
+    let rdata = null;
+    for (let a = 0; a < 2 && !rdata; a++) {
+      try { rdata = await mb.resources(subjectId, { se: rse, ep: rep }); }
+      catch (_) { if (a === 0) await new Promise(r => setTimeout(r, 400)); }
+    }
+    if (process.env.ZX_MB_DEBUG === '1') {
+      console.error('[mb play] subject=' + subjectId + ' se=' + se + ' ep=' + ep + ' list=' +
+        JSON.stringify(((rdata && rdata.list) || []).map(r => ({ res: r.resolution, codec: r.codecName,
+          dur: r.duration, size: r.size, link: (r.resourceLink || '').slice(0, 90), vip: r.vipInfo && r.vipInfo.requireMemberType }))));
+    }
+    const picks = mbPickResources(rdata && rdata.list);
+    const ua = sec.uaKey(req);
+    // play-info gives the CloudFront-signed stream (url + signCookie) and the
+    // streamId that unlocks subtitles. With the premium (PM) headers the BFF
+    // returns the real stream here; movies usually also expose self-signed .mp4
+    // resource links (played natively), while series expose only a DASH .mpd.
+    let pi = null;
+    for (let a = 0; a < 2 && !(pi && pi.streams && pi.streams.length); a++) {
+      try { pi = await mb.playInfo(subjectId, { se, ep }); } catch (_) {}
+      if (!(pi && pi.streams && pi.streams.length) && a === 0) await new Promise(r => setTimeout(r, 400));
+    }
+    const streams = (pi && pi.streams) || [];
+    // MovieBox's shared promo placeholder — never play it as the feature.
+    const AD_RE = /b164fbfb4347792950bdfbfb563d39d9\.mp4/i;
+    const piMp4 = streams.find(s => s && s.url && /\.mp4(\?|$)/i.test(s.url) && !AD_RE.test(s.url));
+    const piDash = streams.find(s => s && s.url && /\.mpd(\?|$)/i.test(s.url));
+
+    if (process.env.ZX_MB_DEBUG === '1') {
+      console.error('[mb play2] picks=' + picks.length + ' streams=' +
+        JSON.stringify(streams.map(s => ({ fmt: s.format, url: (s.url || '').slice(0, 70), ck: !!s.signCookie }))));
+    }
+    let mediaUrl, currentDefinition, qualities, isMp4 = true, isDash = false, hevc = false;
+    if (picks.length) {
+      // Self-signed resource links — best path: multiple resolutions, no cookie.
+      const def = picks.find(p => p.h264) || picks[0];
+      let chosen = def;
+      const wm = want.match(/^r(\d+)$/);
+      if (wm) { const hit = picks.find(p => p.res === Number(wm[1])); if (hit) chosen = hit; }
+      mediaUrl = '/api/hls?t=' + mintHls(chosen.link, req._zxSid, ua, true);
+      currentDefinition = 'r' + chosen.res;
+      qualities = picks.map(p => ({ code: 'r' + p.res, label: p.res + 'p', vip: false }));
+    } else if (piMp4) {
+      // Progressive MP4 stream with its CloudFront cookie (proxy attaches it).
+      const res0 = Number(String(piMp4.resolutions || '').split(',')[0]) || 0;
+      mediaUrl = '/api/hls?t=' + mintHls(piMp4.url, req._zxSid, ua, true, piMp4.signCookie || '');
+      currentDefinition = res0 ? 'r' + res0 : 'auto';
+      qualities = res0 ? [{ code: 'r' + res0, label: res0 + 'p', vip: false }] : [];
+    } else if (piDash) {
+      // Series (and some films): adaptive DASH, played by dash.js. Proxy the
+      // manifest so its segments carry the cookie; dash.js handles quality.
+      mediaUrl = '/api/mbmpd?t=' + mintDash({ mpd: piDash.url, cookie: piDash.signCookie || '', sid: req._zxSid, ua });
+      currentDefinition = 'auto';
+      qualities = [];
+      isMp4 = false; isDash = true;
+      hevc = /h265|hevc/i.test(piDash.url); // flag HEVC so the client can warn if unsupported
+    } else {
+      return fail(res, 502, 'no playable source for this title');
+    }
+
+    // Subtitles from the play-info streamId (best-effort).
+    let subtitles = [];
+    try {
+      const streamId = streams[0] && streams[0].id;
+      if (streamId) {
+        const cap = await mb.streamCaptions(subjectId, streamId);
+        subtitles = ((cap && cap.extCaptions) || [])
+          .filter(c => c && c.url)
+          .map(c => ({
+            lang: (c.lan || 'sub').slice(0, 8),
+            label: c.lanName || c.lan || 'Subtitle',
+            url: '/api/sub?t=' + mintSub(c.url, req._zxSid, ua, true),
+          }));
+      }
+    } catch (_) { /* subtitles are best-effort */ }
+
+    res.json({
+      mediaUrl,
+      currentDefinition,
+      qualities,
+      subtitles,
+      mp4: isMp4,   // progressive MP4 — played natively
+      dash: isDash, // DASH .mpd — played via dash.js
+      hevc,         // true when the DASH stream is HEVC (client checks browser support)
+    });
+  } catch (e) {
+    oops(res, 502, 'playback unavailable', e);
+  }
+});
+
 // unknown /api route -> JSON 404 (don't fall through to the SPA shell / static)
 app.use('/api', (req, res) => fail(res, 404, 'not found'));
 
 // ---- static ----------------------------------------------------------------
 app.use('/vendor', express.static(path.join(__dirname, 'node_modules', 'hls.js', 'dist')));
+app.use('/vendor-dash', express.static(path.join(__dirname, 'node_modules', 'dashjs', 'dist')));
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 

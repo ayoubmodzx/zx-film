@@ -5,6 +5,11 @@
   const view = $('#view');
   const searchInput = $('#searchInput');
   const searchClear = $('#searchClear');
+  // Content source: 'lok' = ZX 1 (Loklok), 'mb' = ZX 2 (MovieBox). The two share
+  // one UI — switching just swaps the /api prefix (MovieBox lives under /api/mb).
+  let SRC = 'lok';
+  try { const s = localStorage.getItem('zx-src'); if (s === 'mb' || s === 'lok') SRC = s; } catch (_) {}
+  function A(sub) { return '/api' + (SRC === 'mb' ? '/mb' : '') + sub; }
   let ZX_TOKEN = null;
   let refreshingToken = null;
   let ZX_TS_SITEKEY = null;
@@ -209,7 +214,7 @@
     view.innerHTML = `<div class="section-pad"></div>` + skeletonRail(7) + skeletonRail(7);
     ZXIcons.apply(view);
     let data;
-    try { data = await api('/api/home'); }
+    try { data = await api(A('/home')); }
     catch (e) { view.innerHTML = stateHTML('warn', 'Connection issue', 'Could not reach the service.'); ZXIcons.apply(view); return; }
     const sections = (data && data.sections) || [];
     if (!sections.length) { view.innerHTML = stateHTML('film', 'Nothing here yet', 'Try searching for a title above.'); ZXIcons.apply(view); return; }
@@ -250,7 +255,7 @@
   }
   async function enrichHero(it) {
     try {
-      const d = await api(`/api/title/${enc(it.id)}`);
+      const d = await api(A(`/title/${enc(it.id)}`));
       const hero = $('#hero'); if (!hero || !d || d.error) return;
       if (d.backdrop) $('.hero-bg', hero).style.backgroundImage = `url('${d.backdrop}')`;
       if (d.intro) $('#heroDesc').textContent = d.intro;
@@ -265,7 +270,7 @@
       <div class="grid">${Array.from({ length: 12 }).map(() => `<div class="card"><div class="poster sk sk-card"></div></div>`).join('')}</div></section>`;
     ZXIcons.apply(view);
     let data;
-    try { data = await api(`/api/search?q=${enc(q)}`); }
+    try { data = await api(A(`/search?q=${enc(q)}`)); }
     catch (e) { if (my === searchSeq) { view.innerHTML = backBtn() + stateHTML('warn', 'Search failed', 'Please try again.'); ZXIcons.apply(view); } return; }
     if (my !== searchSeq) return;
     const results = (data && data.results) || [];
@@ -303,7 +308,7 @@
       <div class="sk" style="height:20px;width:40%;border-radius:8px;margin-bottom:24px"></div>
       <div class="sk" style="height:80px;width:80%;border-radius:8px"></div></div></div></div>`;
     let d;
-    try { d = await api(`/api/title/${enc(id)}${cat !== undefined && cat !== '' ? `?category=${enc(cat)}` : ''}`); }
+    try { d = await api(A(`/title/${enc(id)}${cat !== undefined && cat !== '' ? `?category=${enc(cat)}` : ''}`)); }
     catch (e) { view.innerHTML = backBtn() + stateHTML('warn', 'Could not load', 'Failed to load this title.'); ZXIcons.apply(view); return; }
     if (!d || d.error) { view.innerHTML = backBtn() + stateHTML('warn', 'Not available', 'This title could not be found.'); ZXIcons.apply(view); return; }
     const eps = d.episodes || [];
@@ -432,13 +437,19 @@
   }
   async function loadPlay(definition, resumeTime, buildMenus, requested) {
     const c = P.ctx; if (!c) return;
-    const url = `/api/play?contentId=${enc(c.contentId)}` +
+    const url = A(`/play?contentId=${enc(c.contentId)}`) +
       (c.episodeId ? `&episodeId=${enc(c.episodeId)}` : '') +
       (c.category != null && c.category !== '' ? `&category=${enc(c.category)}` : '') +
       `&definition=${enc(definition)}`;
     let d;
-    try { d = await api(url); }
-    catch (e) { $('#plLoading').hidden = true; toast('Playback service error', 'warn'); return; }
+    // One silent retry — the upstream occasionally blips on a fresh request.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { d = await api(url); break; }
+      catch (e) {
+        if (attempt === 0) { await new Promise(r => setTimeout(r, 700)); continue; }
+        $('#plLoading').hidden = true; toast('Playback service error', 'warn'); return;
+      }
+    }
     if (!d || d.error || !d.mediaUrl) { $('#plLoading').hidden = true; toast(d && d.error ? d.error : 'Stream unavailable', 'warn'); return; }
     P.def = d.currentDefinition || definition;
     if (buildMenus) {
@@ -447,18 +458,67 @@
       buildQualityMenu(); buildSubs();
     }
     updateQualLabel();
-    loadSource(d.mediaUrl, resumeTime || 0);
+    loadSource(d.mediaUrl, resumeTime || 0, d.dash ? 'dash' : (d.mp4 ? 'mp4' : 'hls'), !!d.hevc);
     if (requested && P.def !== requested) {
       const want = P.qualities.find(x => x.code === requested);
       const got = P.qualities.find(x => x.code === P.def);
       toast(`${want ? want.label : 'That quality'} isn’t available — playing ${got ? got.label : P.def}`, 'warn');
     }
   }
-  function loadSource(url, resumeTime) {
+  function hevcSupported() {
+    try {
+      return (window.MediaSource && (MediaSource.isTypeSupported('video/mp4; codecs="hev1.1.6.L93.90"')
+        || MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.90"'))) || false;
+    } catch (e) { return false; }
+  }
+  function loadSource(url, resumeTime, kind, isHevc) {
     const src = url;
     $('#plLoading').hidden = false;
     if (P.hls) { try { P.hls.destroy(); } catch (e) {} P.hls = null; }
+    if (P.dash) { try { P.dash.destroy(); } catch (e) {} P.dash = null; }
     const start = () => { if (resumeTime) { try { V.currentTime = resumeTime; } catch (e) {} } V.play().catch(() => {}); };
+    // MovieBox series stream as adaptive DASH (often HEVC) — play with dash.js.
+    if (kind === 'dash') {
+      // HEVC streams need browser codec support — warn instead of a black screen.
+      if (isHevc && !hevcSupported()) {
+        $('#plLoading').hidden = true;
+        toast('This title uses HEVC, which your browser can’t play. Try Safari, Edge, or a mobile device.', 'warn');
+        return;
+      }
+      if (window.dashjs && dashjs.MediaPlayer) {
+        const player = dashjs.MediaPlayer().create();
+        P.dash = player;
+        // Generous retries so a transient segment/manifest blip recovers silently.
+        player.updateSettings({ streaming: {
+          retryAttempts: { MPD: 3, MediaSegment: 5, InitializationSegment: 4 },
+          retryIntervals: { MPD: 800, MediaSegment: 800 },
+          buffer: { fastSwitchEnabled: true },
+        } });
+        player.initialize(V, src, true);
+        if (resumeTime) player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => { try { V.currentTime = resumeTime; } catch (e) {} });
+        // dash.js self-recovers most errors; give it one silent re-attach before
+        // surfacing anything, so a passing hiccup doesn't flash an error toast.
+        let dashRetried = false;
+        player.on(dashjs.MediaPlayer.events.ERROR, () => {
+          if (!dashRetried && P.dash === player) {
+            dashRetried = true;
+            setTimeout(() => { try { if (P.dash === player) player.attachSource(src); } catch (_) {} }, 700);
+            return;
+          }
+          toast('Stream error', 'warn');
+        });
+      } else {
+        toast('DASH not supported in this browser', 'warn');
+      }
+      return;
+    }
+    // MovieBox movies serve progressive MP4 (proxied, range-enabled) — play it
+    // natively instead of feeding it to hls.js, which only understands HLS.
+    if (kind === 'mp4') {
+      V.src = src;
+      V.addEventListener('loadedmetadata', start, { once: true });
+      return;
+    }
     if (window.Hls && Hls.isSupported()) {
       const hls = new Hls({ maxBufferLength: 30, enableWorker: true });
       P.hls = hls;
@@ -696,6 +756,7 @@
     if (document.fullscreenElement) { try { document.exitFullscreen(); } catch (_) {} }
     try { V.pause(); } catch (_) {}
     if (P.hls) { try { P.hls.destroy(); } catch (_) {} P.hls = null; }
+    if (P.dash) { try { P.dash.destroy(); } catch (_) {} P.dash = null; }
     V.removeAttribute('src'); try { V.load(); } catch (_) {}
     clearTracks();
     P.el.hidden = true; document.body.style.overflow = '';
@@ -881,8 +942,39 @@
       setTimeout(() => finish(false), 12000);
     });
   }
+  // ---- server switch (ZX 1 / ZX 2) -----------------------------------------
+  function setServer(next, opts) {
+    next = (next === 'mb') ? 'mb' : 'lok';
+    const changed = next !== SRC;
+    SRC = next;
+    try { localStorage.setItem('zx-src', SRC); } catch (_) {}
+    const tog = $('#srvToggle');
+    if (tog) {
+      tog.classList.toggle('mb', SRC === 'mb');
+      $$('.srv-opt', tog).forEach(b => {
+        const on = b.dataset.src === SRC;
+        b.classList.toggle('is-active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+    if (opts && opts.rerender && changed) {
+      closePlayer(true);
+      searchInput.value = ''; searchClear.hidden = true;
+      if (location.hash === '#/' || location.hash === '') route(); else go('#/');
+    }
+  }
+  function setupServerToggle() {
+    const tog = $('#srvToggle'); if (!tog) return;
+    tog.addEventListener('click', (e) => {
+      const b = e.target.closest('.srv-opt'); if (!b) return;
+      setServer(b.dataset.src, { rerender: true });
+    });
+    setServer(SRC); // reflect the persisted choice on load
+  }
+
   ZXIcons.apply(document);
   setPlayIcons();
   setupSupport();
+  setupServerToggle();
   initSession().then(route);
 })();
